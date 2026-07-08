@@ -1,0 +1,12 @@
+# local index (derived; rebuilt on demand) — never commit note content
+*.db
+*.db-wal
+*.db-shm
+recall.db*
+
+# python
+__pycache__/
+*.pyc
+
+# os
+.DS_Store

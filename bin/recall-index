@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""recall-index -- Phase 0 collector/indexer for cross-project Claude memory notes.
+
+Discovers every ~/.claude/projects/*/memory/**/*.md across ALL projects and builds a
+SQLite FTS5 index at ~/.claude/recall/recall.db for the `recall` search CLI.
+
+STRICTLY READ-ONLY over the source notes: this script only ever reads the *.md files
+and only ever writes ~/.claude/recall/recall.db (+ a -wal/-shm alongside it). It never
+touches anything under ~/.claude/projects/*/memory/.
+
+Local only, no network, no daemon. Stdlib + sqlite3 only.
+
+Index is idempotent + incremental: unchanged files (same mtime + size) are skipped,
+changed/new files are re-indexed, and files removed from disk are pruned from the db.
+Re-run it any time to refresh. Use --rebuild to force a full reindex.
+"""
+import argparse
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+PROJECTS_DIR = HOME / ".claude" / "projects"
+RECALL_DIR = HOME / ".claude" / "recall"
+DB_PATH = RECALL_DIR / "recall.db"
+SCHEMA_VERSION = "1"
+
+# Encoded form of $HOME as it appears in the project-slug directory names, e.g.
+# /Users/alice -> -Users-alice . Claude Code derives project dir names by replacing
+# every '/' in the absolute project path with '-'.
+HOME_ENCODED = str(HOME).replace("/", "-")
+
+
+def derive_slug(project_dir_name: str) -> str:
+    """Friendly project slug from a `-Users-alice-...` directory name.
+
+    -Users-alice-tools-raptor      -> tools-raptor
+    -Users-alice-Documents-Work-.. -> Documents-Work-..
+    -Users-alice                   -> home
+    """
+    if project_dir_name == HOME_ENCODED:
+        return "home"
+    prefix = HOME_ENCODED + "-"
+    if project_dir_name.startswith(prefix):
+        return project_dir_name[len(prefix):]
+    # Unexpected shape (different home): strip a single leading dash for readability.
+    return project_dir_name.lstrip("-") or project_dir_name
+
+
+def _read_text(path: Path) -> str:
+    # Notes are UTF-8 markdown; be tolerant of the odd stray byte so indexing never
+    # aborts on one bad file. errors='replace' keeps offsets stable for display.
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def extract_title(text: str, filename: str) -> str:
+    """Best-effort human title for a note, in priority order:
+
+    1. first markdown H1 (`# ...`) in the body
+    2. YAML frontmatter `description:` (quotes stripped)
+    3. YAML frontmatter `name:`
+    4. first non-empty body line
+    5. the filename
+    Purely descriptive metadata for display; never used for matching.
+    """
+    lines = text.splitlines()
+    fm_desc = None
+    fm_name = None
+    body_start = 0
+
+    # Parse a leading `---` ... `---` YAML frontmatter block, if present.
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                body_start = i + 1
+                break
+            stripped = lines[i].strip()
+            if fm_desc is None and stripped.lower().startswith("description:"):
+                fm_desc = stripped[len("description:"):].strip().strip('"').strip("'")
+            elif fm_name is None and stripped.lower().startswith("name:"):
+                fm_name = stripped[len("name:"):].strip().strip('"').strip("'")
+
+    # 1. first H1 heading in the body
+    for line in lines[body_start:]:
+        s = line.strip()
+        if s.startswith("# "):
+            return s[2:].strip()
+
+    # 2/3. frontmatter description / name
+    if fm_desc:
+        return fm_desc
+    if fm_name:
+        return fm_name
+
+    # 4. first non-empty body line
+    for line in lines[body_start:]:
+        s = line.strip()
+        if s and s != "---":
+            return s
+
+    # 5. filename fallback
+    return filename
+
+
+def detect_tokenizer(conn: sqlite3.Connection):
+    """Return the best available FTS5 tokenizer, or None if FTS5 is unavailable.
+
+    Prefer 'trigram' (arbitrary-substring matching -> exact tokens like CVE-2024-1234,
+    0xdeadbeef, 26.4.7, path/to/file.c:1337 are all matchable). Fall back to 'unicode61'
+    (word tokenizer) if trigram is missing, then to None if FTS5 itself is absent.
+    """
+    for tok in ("trigram", "unicode61"):
+        try:
+            conn.execute(f"CREATE VIRTUAL TABLE _probe_{tok} USING fts5(x, tokenize='{tok}')")
+            conn.execute(f"DROP TABLE _probe_{tok}")
+            return tok
+        except sqlite3.OperationalError:
+            continue
+    return None
+
+
+def ensure_base_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notes (
+            id          INTEGER PRIMARY KEY,
+            path        TEXT UNIQUE NOT NULL,   -- absolute file path
+            project_dir TEXT NOT NULL,          -- raw -Users-alice-... dir name
+            slug        TEXT NOT NULL,          -- friendly slug
+            filename    TEXT NOT NULL,
+            is_index    INTEGER NOT NULL,       -- 1 = MEMORY.md index, 0 = topic file
+            title       TEXT NOT NULL,
+            mtime       REAL NOT NULL,
+            size        INTEGER NOT NULL,
+            content     TEXT NOT NULL           -- full verbatim text (for FTS + title)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_slug ON notes(slug)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+
+
+def get_meta(conn: sqlite3.Connection, key: str, default=None):
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
+    )
+
+
+def fts_table_exists(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='notes_fts'"
+    ).fetchone()
+    return row is not None
+
+
+def discover_notes():
+    """Yield (path, project_dir, slug) for every memory note under every project."""
+    if not PROJECTS_DIR.is_dir():
+        return
+    for project_path in sorted(PROJECTS_DIR.iterdir()):
+        memory_dir = project_path / "memory"
+        if not memory_dir.is_dir():
+            continue
+        project_dir = project_path.name
+        slug = derive_slug(project_dir)
+        for md in sorted(memory_dir.rglob("*.md")):
+            if md.is_file():
+                yield md, project_dir, slug
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Build/refresh the recall FTS index.")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="force a full reindex (ignore mtime/size skip cache)")
+    ap.add_argument("--db", default=str(DB_PATH), help="index db path (default: %(default)s)")
+    ap.add_argument("--quiet", action="store_true", help="suppress the summary output")
+    args = ap.parse_args()
+
+    db_path = Path(args.db)
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"error: cannot create index dir {db_path.parent}: {e}", file=sys.stderr)
+        return 2
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    ensure_base_schema(conn)
+
+    # --- decide tokenizer / whether FTS needs a full rebuild ------------------
+    tokenizer = detect_tokenizer(conn)
+    fts_available = tokenizer is not None
+    stored_tok = get_meta(conn, "tokenizer")
+    stored_schema = get_meta(conn, "schema_version")
+
+    full_reindex = args.rebuild or stored_schema != SCHEMA_VERSION
+    fts_needs_full = False
+
+    if fts_available:
+        need_new_fts = (
+            not fts_table_exists(conn)
+            or stored_tok != tokenizer
+            or full_reindex
+        )
+        if need_new_fts:
+            conn.execute("DROP TABLE IF EXISTS notes_fts")
+            # Standalone (non-external-content) FTS5 table keyed by notes.id so that
+            # per-row DELETE/INSERT work for incremental updates.
+            conn.execute(
+                f"CREATE VIRTUAL TABLE notes_fts USING fts5(content, tokenize='{tokenizer}')"
+            )
+            fts_needs_full = True
+    else:
+        conn.execute("DROP TABLE IF EXISTS notes_fts")
+
+    if full_reindex:
+        # Forget the skip cache so every file is re-read.
+        conn.execute("DELETE FROM notes")
+        fts_needs_full = fts_available  # empty notes -> nothing to backfill, but harmless
+
+    # --- scan the corpus ------------------------------------------------------
+    existing = {
+        row[0]: (row[1], row[2])  # path -> (mtime, size)
+        for row in conn.execute("SELECT path, mtime, size FROM notes")
+    }
+    seen_paths = set()
+    slugs = set()
+    added = updated = unchanged = 0
+
+    for md, project_dir, slug in discover_notes():
+        path = str(md)
+        seen_paths.add(path)
+        slugs.add(slug)
+        st = md.stat()
+        mtime, size = st.st_mtime, st.st_size
+
+        if path in existing and not fts_needs_full:
+            old_mtime, old_size = existing[path]
+            if old_mtime == mtime and old_size == size:
+                unchanged += 1
+                continue
+
+        # (Re)read + (re)index this file.
+        text = _read_text(md)
+        filename = md.name
+        is_index = 1 if filename == "MEMORY.md" else 0
+        title = extract_title(text, filename)
+
+        is_new = path not in existing
+        conn.execute(
+            """
+            INSERT INTO notes(path, project_dir, slug, filename, is_index, title, mtime, size, content)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(path) DO UPDATE SET
+                project_dir=excluded.project_dir, slug=excluded.slug,
+                filename=excluded.filename, is_index=excluded.is_index,
+                title=excluded.title, mtime=excluded.mtime, size=excluded.size,
+                content=excluded.content
+            """,
+            (path, project_dir, slug, filename, is_index, title, mtime, size, text),
+        )
+        if is_new:
+            added += 1
+        else:
+            updated += 1
+
+        if fts_available and not fts_needs_full:
+            rowid = conn.execute("SELECT id FROM notes WHERE path=?", (path,)).fetchone()[0]
+            conn.execute("DELETE FROM notes_fts WHERE rowid=?", (rowid,))
+            conn.execute("INSERT INTO notes_fts(rowid, content) VALUES(?,?)", (rowid, text))
+
+    # --- prune deleted files --------------------------------------------------
+    removed = 0
+    for path in list(existing.keys()):
+        if path not in seen_paths:
+            rowid_row = conn.execute("SELECT id FROM notes WHERE path=?", (path,)).fetchone()
+            if rowid_row:
+                if fts_available:
+                    conn.execute("DELETE FROM notes_fts WHERE rowid=?", (rowid_row[0],))
+                conn.execute("DELETE FROM notes WHERE path=?", (path,))
+                removed += 1
+
+    # --- backfill FTS from scratch when the table was recreated ---------------
+    if fts_available and fts_needs_full:
+        conn.execute("DELETE FROM notes_fts")
+        for rowid, content in conn.execute("SELECT id, content FROM notes"):
+            conn.execute("INSERT INTO notes_fts(rowid, content) VALUES(?,?)", (rowid, content))
+
+    total_rows = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    set_meta(conn, "schema_version", SCHEMA_VERSION)
+    set_meta(conn, "tokenizer", tokenizer if tokenizer else "none")
+    set_meta(conn, "fts_available", "1" if fts_available else "0")
+    set_meta(conn, "built_at", str(int(time.time())))
+    conn.commit()
+    conn.execute("PRAGMA optimize")
+    conn.close()
+
+    # --- summary --------------------------------------------------------------
+    if not args.quiet:
+        print("recall-index summary")
+        print(f"  db            : {db_path}")
+        print(f"  projects      : {len(slugs)}")
+        print(f"  files on disk : {len(seen_paths)}")
+        print(f"  rows indexed  : {total_rows}")
+        print(f"  added         : {added}")
+        print(f"  updated       : {updated}")
+        print(f"  unchanged     : {unchanged}")
+        print(f"  removed       : {removed}")
+        if fts_available:
+            print(f"  FTS5          : available (tokenizer={tokenizer})")
+        else:
+            print("  FTS5          : UNAVAILABLE -- `recall` will use the ripgrep lane only")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
