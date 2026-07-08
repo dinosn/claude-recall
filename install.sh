@@ -18,7 +18,10 @@ fi
 mkdir -p "$DEST" "$CMDDIR"
 cp "$HERE/bin/recall" "$HERE/bin/recall-index" "$DEST/"
 chmod +x "$DEST/recall" "$DEST/recall-index"
-cp "$HERE/commands/recall.md" "$CMDDIR/recall.md"
+# The command file is authored for the plugin runtime (uses ${CLAUDE_PLUGIN_ROOT}).
+# For a standalone CLI install, rewrite that to the absolute installed path.
+sed "s#\${CLAUDE_PLUGIN_ROOT}/bin/recall#$DEST/recall#g" \
+    "$HERE/commands/recall.md" > "$CMDDIR/recall.md"
 
 echo "Building initial index…"
 "$DEST/recall-index" || true

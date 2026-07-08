@@ -1,0 +1,15 @@
+{
+  "name": "dinosn",
+  "owner": {
+    "name": "Nicolas Krassas",
+    "url": "https://github.com/dinosn"
+  },
+  "plugins": [
+    {
+      "name": "claude-recall",
+      "source": "./",
+      "description": "Verbatim, local, cross-project search over your Claude Code memory notes (ripgrep + SQLite FTS5).",
+      "version": "1.0.0"
+    }
+  ]
+}

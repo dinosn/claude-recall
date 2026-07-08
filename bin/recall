@@ -276,7 +276,7 @@ def main() -> int:
     # Auto-refresh: incremental reindex so notes added/edited since the last run are
     # searchable without any manual step. Fast (mtime/size skip). Disable with --no-refresh.
     if not args.no_refresh:
-        idx = RECALL_DIR / "recall-index"
+        idx = Path(__file__).resolve().parent / "recall-index"
         try:
             subprocess.run([sys.executable, str(idx), "--quiet", "--db", args.db],
                            capture_output=True, timeout=120)

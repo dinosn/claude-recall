@@ -1,0 +1,13 @@
+{
+  "name": "claude-recall",
+  "version": "1.0.0",
+  "description": "Verbatim, local, cross-project search over your Claude Code memory notes (ripgrep + SQLite FTS5). No cloud, no daemon.",
+  "author": {
+    "name": "Nicolas Krassas",
+    "url": "https://github.com/dinosn"
+  },
+  "homepage": "https://github.com/dinosn/claude-recall",
+  "repository": "https://github.com/dinosn/claude-recall",
+  "license": "MIT",
+  "keywords": ["memory", "recall", "search", "claude-code", "fts5", "ripgrep", "notes"]
+}

@@ -41,13 +41,28 @@ Results are deduped by file+line, ranked best-first, and printed as `[project] p
 
 ## Install
 
+### As a Claude Code plugin (recommended)
+
+In Claude Code:
+
+```
+/plugin marketplace add dinosn/claude-recall
+/plugin install claude-recall@dinosn
+```
+
+That's it — the `/recall` command is now available. The index builds itself on first search and auto-refreshes after that. Requires `python3` and (recommended) `ripgrep` on your `PATH`.
+
+### As a standalone CLI (optional)
+
+If you also want the `recall` command in your terminal (outside Claude Code):
+
 ```sh
 git clone https://github.com/dinosn/claude-recall.git
 cd claude-recall
 ./install.sh
 ```
 
-This installs the two scripts to `~/.claude/recall/`, registers the `/recall` slash command in `~/.claude/commands/`, and builds the initial index.
+This copies the scripts to `~/.claude/recall/`, registers the `/recall` command, and builds the initial index. Add `~/.claude/recall` to your `PATH` to call `recall` from anywhere.
 
 ## Usage
 
