@@ -13,6 +13,11 @@ Local only, no network, no daemon. Stdlib + sqlite3 only.
 Index is idempotent + incremental: unchanged files (same mtime + size) are skipped,
 changed/new files are re-indexed, and files removed from disk are pruned from the db.
 Re-run it any time to refresh. Use --rebuild to force a full reindex.
+
+The FTS5 table is multi-column (title, path_text, content) so the `recall` search side
+can weight structure over prose via bm25 field weights. `path_text` is a friendly
+slug + memory-relative path recomputed at insert time; it is NEVER stored in the base
+`notes` table (which stays byte-identical), keeping migration ALTER-free.
 """
 import argparse
 import os
@@ -25,7 +30,7 @@ HOME = Path.home()
 PROJECTS_DIR = HOME / ".claude" / "projects"
 RECALL_DIR = HOME / ".claude" / "recall"
 DB_PATH = RECALL_DIR / "recall.db"
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 # Encoded form of $HOME as it appears in the project-slug directory names, e.g.
 # /Users/alice -> -Users-alice . Claude Code derives project dir names by replacing
@@ -49,6 +54,18 @@ def derive_slug(project_dir_name: str) -> str:
     return project_dir_name.lstrip("-") or project_dir_name
 
 
+def fts_path_text(slug: str, path: str) -> str:
+    """Friendly, low-noise path text for the FTS `path_text` column.
+
+    "tools-raptor archive/INDEX.md" -- the slug is a first-class token and the path
+    relative to the note's memory/ dir discriminates by subfolder. We deliberately do
+    NOT index the absolute path: the repeated 55-char home prefix would turn every note
+    into trigram soup and make a project-slug query match the whole corpus.
+    """
+    rel = path.split("/memory/", 1)[1] if "/memory/" in path else os.path.basename(path)
+    return f"{slug} {rel}"
+
+
 def _read_text(path: Path) -> str:
     # Notes are UTF-8 markdown; be tolerant of the odd stray byte so indexing never
     # aborts on one bad file. errors='replace' keeps offsets stable for display.
@@ -64,7 +81,9 @@ def extract_title(text: str, filename: str) -> str:
     3. YAML frontmatter `name:`
     4. first non-empty body line
     5. the filename
-    Purely descriptive metadata for display; never used for matching.
+    The title is a search field weighted 4x in the multi-column FTS, so the H1 scan is
+    fence-aware: a `# ...` inside a ``` / ~~~ code block is NOT a heading and must not
+    become the (heavily weighted) title.
     """
     lines = text.splitlines()
     fm_desc = None
@@ -83,9 +102,17 @@ def extract_title(text: str, filename: str) -> str:
             elif fm_name is None and stripped.lower().startswith("name:"):
                 fm_name = stripped[len("name:"):].strip().strip('"').strip("'")
 
-    # 1. first H1 heading in the body
+    # 1. first H1 heading in the body -- skip fenced code blocks (a `# ` inside ``` is not
+    #    a heading). Only a run of >=3 back-ticks/tildes at <=3 indent toggles a fence.
+    in_fence = False
     for line in lines[body_start:]:
-        s = line.strip()
+        s = line.lstrip()
+        indent = len(line) - len(s)
+        if indent <= 3 and (s.startswith("```") or s.startswith("~~~")):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         if s.startswith("# "):
             return s[2:].strip()
 
@@ -217,9 +244,12 @@ def main() -> int:
         if need_new_fts:
             conn.execute("DROP TABLE IF EXISTS notes_fts")
             # Standalone (non-external-content) FTS5 table keyed by notes.id so that
-            # per-row DELETE/INSERT work for incremental updates.
+            # per-row DELETE/INSERT work for incremental updates. Three columns so the
+            # search side can weight title/path over body via bm25 field weights;
+            # unqualified MATCH still searches every column.
             conn.execute(
-                f"CREATE VIRTUAL TABLE notes_fts USING fts5(content, tokenize='{tokenizer}')"
+                f"CREATE VIRTUAL TABLE notes_fts USING "
+                f"fts5(title, path_text, content, tokenize='{tokenizer}')"
             )
             fts_needs_full = True
     else:
@@ -279,7 +309,10 @@ def main() -> int:
         if fts_available and not fts_needs_full:
             rowid = conn.execute("SELECT id FROM notes WHERE path=?", (path,)).fetchone()[0]
             conn.execute("DELETE FROM notes_fts WHERE rowid=?", (rowid,))
-            conn.execute("INSERT INTO notes_fts(rowid, content) VALUES(?,?)", (rowid, text))
+            conn.execute(
+                "INSERT INTO notes_fts(rowid, title, path_text, content) VALUES(?,?,?,?)",
+                (rowid, title, fts_path_text(slug, path), text),
+            )
 
     # --- prune deleted files --------------------------------------------------
     removed = 0
@@ -295,8 +328,13 @@ def main() -> int:
     # --- backfill FTS from scratch when the table was recreated ---------------
     if fts_available and fts_needs_full:
         conn.execute("DELETE FROM notes_fts")
-        for rowid, content in conn.execute("SELECT id, content FROM notes"):
-            conn.execute("INSERT INTO notes_fts(rowid, content) VALUES(?,?)", (rowid, content))
+        for rowid, slug, path, title, content in conn.execute(
+            "SELECT id, slug, path, title, content FROM notes"
+        ):
+            conn.execute(
+                "INSERT INTO notes_fts(rowid, title, path_text, content) VALUES(?,?,?,?)",
+                (rowid, title, fts_path_text(slug, path), content),
+            )
 
     total_rows = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
     set_meta(conn, "schema_version", SCHEMA_VERSION)

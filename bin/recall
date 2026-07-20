@@ -6,30 +6,75 @@
 Two lanes, fused:
   (a) ripgrep exact  -- fixed-string, smart-case scan of the actual note files. Precise
       tokens (CVE ids, hex, versions, `foo->bar`) match exactly, verbatim from disk.
-  (b) FTS5 BM25      -- lexical rank over the index built by `recall-index` (trigram
-      tokenizer -> arbitrary-substring matching; degrades to unicode61 or lane (a) only).
+  (b) FTS5 BM25      -- lexical rank over the index built by `recall-index` (multi-column
+      title/path/content with field weights; trigram tokenizer -> arbitrary-substring
+      matching; degrades to unicode61 or lane (a) only).
 
-Results are fused with Reciprocal Rank Fusion (RRF, k=60), deduped by file+line, and
-printed best-first with a fully deterministic tie-break (slug, path, line). Every hit
-shows the EXACT source line(s) with a little context -- nothing is paraphrased.
+The two lanes are fused at FILE granularity with Reciprocal Rank Fusion (RRF, k=60): each
+lane produces a ranked list of files (FTS by bm25, rg by descending match count) and RRF
+combines them, so one strong file never occupies several consecutive ranks. Literal-looking
+queries (CVE ids, hex, versions, paths) weight the exact lane higher. Line selection is pure
+presentation on top of the fused file order. Every hit shows the EXACT source line(s) with a
+little context and, when available, the enclosing markdown heading breadcrumb -- nothing is
+paraphrased. Output is fully deterministic (score desc, then slug, path, line).
 
 Local only, no network. Reads the index db (read-only) and the note files themselves.
 """
 import argparse
 import json
+import math
 import os
 import re
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HOME = Path.home()
 RECALL_DIR = HOME / ".claude" / "recall"
 DB_PATH = RECALL_DIR / "recall.db"
+SCHEMA_VERSION = "2"       # must match recall-index; drives the forced-refresh migration
 RRF_K = 60                 # standard RRF damping constant
 FTS_LINES_PER_FILE = 5     # cap lines surfaced per file from the FTS lane
 TITLE_MAX = 90
+# bm25 field weights for the multi-column FTS (title, path_text, content).
+BM25_WEIGHTS = (4.0, 1.5, 1.0)
+
+
+def _throttle_from_env():
+    """Refresh-throttle seconds from the env, parsed defensively.
+
+    A bad RECALL_REFRESH_THROTTLE_SEC must never crash the tool (it would break every
+    search, even --no-refresh). Non-numeric / negative / non-finite -> the 5s default.
+    """
+    raw = os.environ.get("RECALL_REFRESH_THROTTLE_SEC")
+    if raw is None:
+        return 5.0
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 5.0
+    return v if math.isfinite(v) and v >= 0 else 5.0
+
+
+# Skip the per-search auto-refresh subprocess if the index was rebuilt this recently.
+RECALL_REFRESH_THROTTLE_SEC = _throttle_from_env()
+
+
+def finite_weight(raw):
+    """argparse type for --rg-weight/--fts-weight: a finite, non-negative float.
+
+    A non-finite weight (nan/inf) would poison the RRF sort key -- nan comparisons are all
+    False, so the total order collapses and output becomes input-order (hash-seed) dependent.
+    """
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r}")
+    if not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError(f"weight must be finite and >= 0: {raw!r}")
+    return v
 
 
 # --------------------------------------------------------------------------- db
@@ -50,6 +95,39 @@ def get_meta(conn, key, default=None):
         return row[0] if row else default
     except sqlite3.OperationalError:
         return default
+
+
+def should_refresh(db_path, force):
+    """Decide whether to spawn the auto-refresh subprocess (E: refresh throttle).
+
+    Returns True iff any of: the db is missing; its meta.built_at is missing/unreadable
+    (age treated as infinite); the last build is older than the throttle window; --refresh
+    was passed; or the stored schema_version is stale (forces the migration rebuild even
+    inside the throttle window, so the first post-upgrade search never serves old results).
+    Read-only probe -- recall never writes the index. Caller guards on --no-refresh.
+    """
+    if force:
+        return True
+    if not db_path.exists():
+        return True
+    try:
+        probe = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            built_at = get_meta(probe, "built_at")
+            schema_version = get_meta(probe, "schema_version")
+        finally:
+            probe.close()
+    except sqlite3.OperationalError:
+        return True
+    if schema_version != SCHEMA_VERSION:   # stale schema -> force rebuild, bypass throttle
+        return True
+    try:
+        age = time.time() - float(built_at)
+    except (TypeError, ValueError):
+        return True                         # unreadable built_at -> treat as stale
+    if not math.isfinite(age) or age < 0:
+        return True                         # nan/inf or future timestamp -> treat as stale
+    return age >= RECALL_REFRESH_THROTTLE_SEC
 
 
 def load_candidates(conn, project_filter):
@@ -92,8 +170,10 @@ def read_lines(path):
 
 # -------------------------------------------------------------------- lane A: rg
 def ripgrep_lane(query_str, paths):
-    """Fixed-string, smart-case ripgrep over `paths`. Returns list of (path, line).
+    """Fixed-string, smart-case ripgrep over `paths`. Returns list of (path, line, nsub).
 
+    `nsub` is the number of matches ON that line (rg's submatch count), so a file's
+    relevance count reflects genuine occurrences, not just how many lines happened to match.
     Deterministic: we sort the results ourselves, so rg's internal ordering is
     irrelevant. Config files are disabled for reproducibility.
     """
@@ -130,7 +210,8 @@ def ripgrep_lane(query_str, paths):
         ln = data.get("line_number")
         if p is None or ln is None:
             continue
-        hits.append((p, int(ln)))
+        nsub = len(data.get("submatches") or []) or 1
+        hits.append((p, int(ln), nsub))
     return hits
 
 
@@ -163,7 +244,7 @@ def fts_lane(conn, match_str, candidate_ids):
         return []
     try:
         rows = conn.execute(
-            "SELECT rowid, bm25(notes_fts) AS score FROM notes_fts "
+            "SELECT rowid, bm25(notes_fts, 4.0, 1.5, 1.0) AS score FROM notes_fts "
             "WHERE notes_fts MATCH ? ORDER BY score ASC, rowid ASC",
             (match_str,),
         ).fetchall()
@@ -201,16 +282,55 @@ def fts_lines_for_file(path, tokens):
 
 
 # ------------------------------------------------------------------------ fuse
-def rrf_fuse(rank_lists):
-    """Reciprocal Rank Fusion over an iterable of ranked key-lists.
+def looks_literal(query_str):
+    """True if the query looks like an exact literal (CVE id, hex, version, path, ...).
 
-    rank_lists: list of lists; each inner list is keys ordered best-first.
-    Returns {key: fused_score}. score = sum 1/(RRF_K + rank), rank 0-based.
+    A deterministic pure function of the query text -- when true we weight the ripgrep
+    exact lane higher (mirrors qmd's 2x original-query weighting). Conservative on hex
+    (>=8 chars AND at least one digit) so ordinary all-alpha words never misfire. The slash
+    rule only fires on path-SHAPED tokens (absolute, ./ relative, >=2 segments, or a dotted
+    extension) so ordinary prose compounds like `and/or` or `input/output` are NOT treated as
+    literal. Common wrapping punctuation (back-ticks, quotes, brackets, a trailing comma) is
+    stripped first so `` `CVE-2024-1234` `` and `1.2.3,` still match.
+    """
+    for tok in query_str.split():
+        t = tok.strip("`'\"()[]{}<>").rstrip(",;:.")
+        if not t:
+            continue
+        if re.fullmatch(r'(?i)cve-\d{4}-\d{4,}', t):
+            return True
+        if re.fullmatch(r'0x[0-9a-fA-F]+', t):
+            return True
+        if re.fullmatch(r'(?i)v?\d+\.\d+(?:\.\d+)+(?:[-+][0-9a-z.]+)?', t):  # semver (opt v/suffix)
+            return True
+        if re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}', t):                  # IPv4
+            return True
+        if re.fullmatch(r'(?=[0-9a-fA-F]*\d)[0-9a-fA-F]{8,}', t):        # long hex w/ a digit
+            return True
+        if '->' in t or '::' in t:
+            return True
+        if '/' in t and (t.startswith(('/', './', '../'))               # path-shaped only
+                         or t.count('/') >= 2
+                         or re.search(r'/[^/]*\.[A-Za-z0-9]+$', t)):
+            return True
+    return False
+
+
+def rrf_fuse_files(rg_files, fts_files, w_rg, w_fts):
+    """Weighted Reciprocal Rank Fusion at FILE granularity.
+
+    rg_files / fts_files: lists of file keys (paths) ordered best-first, one entry per
+    file (no line explosion). Returns {path: fused_score}, where
+        S = w_rg *[path in rg]  * 1/(RRF_K + rank_rg)
+          + w_fts*[path in fts] * 1/(RRF_K + rank_fts)      (ranks 0-based)
+    Fusing files (not file+line) removes the old bias where one FTS file occupied up to
+    five consecutive RRF ranks; line selection is pure presentation downstream.
     """
     scores = {}
-    for keys in rank_lists:
-        for rank, key in enumerate(keys):
-            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+    for rank, path in enumerate(rg_files):
+        scores[path] = scores.get(path, 0.0) + w_rg * 1.0 / (RRF_K + rank)
+    for rank, path in enumerate(fts_files):
+        scores[path] = scores.get(path, 0.0) + w_fts * 1.0 / (RRF_K + rank)
     return scores
 
 
@@ -220,15 +340,115 @@ def shorten(s, n=TITLE_MAX):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def print_hit(note, line_no, context):
+_ATX_RE = re.compile(r"^(#{1,6})\s+(.*)")
+_BOLD_RE = re.compile(r"^\*\*(.+?)\*\*")
+_FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
+
+# path -> (headings, bolds); headings = [(line_no, level, rendered)], bolds = [(line_no, text)].
+# Computed once per file so a file with many hits does not rescan from line 1 each time.
+_ANCHOR_CACHE = {}
+
+
+def _file_anchors(path):
+    """One fence-aware scan of a file, cached: its ATX headings and bold lead-ins.
+
+    Fence tracking is CommonMark-shaped: a fence opens on a run of >=3 back-ticks or tildes
+    at <=3 spaces indent, and closes only on a run of the SAME character, at least as long,
+    whose line holds nothing but the fence (and optional trailing spaces) -- so a `~~~` inside
+    a ``` block, or a shorter run, does NOT close it. A `#` inside a fence is never a heading.
+    """
+    if path in _ANCHOR_CACHE:
+        return _ANCHOR_CACHE[path]
+    headings, bolds = [], []
+    fence_char, fence_len = None, 0
+    for idx, raw in enumerate(read_lines(path), start=1):
+        s = raw.lstrip()
+        indent = len(raw) - len(s)
+        fm = _FENCE_RE.match(s) if indent <= 3 else None
+        if fence_char is None:
+            if fm:                              # opening fence (may carry an info string)
+                fence_char, fence_len = fm.group(1)[0], len(fm.group(1))
+                continue
+        else:
+            if (fm and fm.group(1)[0] == fence_char and len(fm.group(1)) >= fence_len
+                    and s[len(fm.group(1)):].strip() == ""):
+                fence_char = None               # matching closer ends the fence
+            continue                            # never emit anchors from inside a fence
+        if indent <= 3:
+            m = _ATX_RE.match(s)
+            if m:
+                lvl = len(m.group(1))
+                headings.append((idx, lvl, f"{'#' * lvl} {m.group(2).strip()}"))
+                continue
+        b = _BOLD_RE.match(s)
+        if b:
+            bolds.append((idx, b.group(1).strip()))
+    _ANCHOR_CACHE[path] = (headings, bolds)
+    return _ANCHOR_CACHE[path]
+
+
+def heading_breadcrumb(path, line_no):
+    """Enclosing markdown-heading breadcrumb for a hit line. Verbatim from disk.
+
+    A nearest-anchor ladder, first match wins (literal heading chains are blank for
+    ~72% of these prose notes, so a plain qmd-style chain would be near-useless):
+      1. ATX chain -- the 6-slot heading stack in effect just above the hit line, fence-aware
+         so a `#` inside a ``` code block never yields a bogus crumb. Rendered `## a > ### b`.
+      2. bold lead-in -- else the nearest preceding `**...**` line, the de-facto section
+         header in these notes.
+      3. nothing.
+    Returns (crumb_or_None, anchor_line_or_None); anchor_line is the source line the crumb
+    came from so the caller can suppress it when it is already in the context window.
+    Reads from the per-file anchor cache (one scan per file, not one per hit).
+    """
+    headings, bolds = _file_anchors(path)
+    stack = [None] * 6       # slot i == heading level i+1
+    anchor = [None] * 6      # source line each slot came from
+    for hl, lvl, rendered in headings:
+        if hl >= line_no:
+            break
+        stack[lvl - 1] = rendered
+        anchor[lvl - 1] = hl
+        for d in range(lvl, 6):     # clear deeper slots
+            stack[d] = None
+            anchor[d] = None
+    slots = [(s, a) for s, a in zip(stack, anchor) if s]
+    if slots:
+        crumb = " > ".join(s for s, _ in slots)
+        return crumb, slots[-1][1]
+    bold = None
+    for bl, text in bolds:
+        if bl >= line_no:
+            break
+        bold = (text, bl)
+    if bold is not None:
+        return bold
+    return None, None
+
+
+def print_hit(note, line_no, context, breadcrumb=True):
     path = note["path"]
     lines = read_lines(path)
     total = len(lines)
+    if line_no == 0:
+        # File-level hit: FTS matched the title/path but the (empty/all-blank) body has no
+        # line to surface. Show the header + title, no invented source line.
+        print(f"[{note['slug']}]  {path}")
+        if note["title"]:
+            print(f"    — {shorten(note['title'])}")
+        print("    ┄ (matched on title/path — no content line)")
+        print()
+        return
     print(f"[{note['slug']}]  {path}:{line_no}")
     if note["title"]:
         print(f"    — {shorten(note['title'])}")
     lo = max(1, line_no - context)
     hi = min(total, line_no + context)
+    if breadcrumb:
+        crumb, anchor = heading_breadcrumb(path, line_no)
+        # Suppress a crumb whose source line is already shown in the context window.
+        if crumb and not (anchor is not None and lo <= anchor <= hi):
+            print(f"    ┄ {shorten(crumb)}")
     for i in range(lo, hi + 1):
         text = lines[i - 1] if i - 1 < total else ""
         marker = "  > " if i == line_no else "    "
@@ -258,6 +478,15 @@ def main() -> int:
     ap.add_argument("--no-refresh", action="store_true",
                     help="skip the automatic incremental reindex before searching (faster; "
                          "use when you know the corpus is unchanged)")
+    ap.add_argument("--refresh", action="store_true",
+                    help="force the incremental reindex even inside the throttle window")
+    ap.add_argument("--no-breadcrumb", action="store_true",
+                    help="omit the enclosing-heading breadcrumb line (byte-stable output)")
+    ap.add_argument("--rg-weight", type=finite_weight, default=None,
+                    help="RRF weight for the exact lane (default: 2.0 for literal-looking "
+                         "queries, else 1.0)")
+    ap.add_argument("--fts-weight", type=finite_weight, default=None,
+                    help="RRF weight for the FTS lane (default 1.0)")
     args = ap.parse_args()
     try:
         # Preserve any surrogateescape'd bytes on the way out (see read_lines).
@@ -274,12 +503,21 @@ def main() -> int:
     query_str = " ".join(tokens)
 
     # Auto-refresh: incremental reindex so notes added/edited since the last run are
-    # searchable without any manual step. Fast (mtime/size skip). Disable with --no-refresh.
-    if not args.no_refresh:
+    # searchable without any manual step. Fast (mtime/size skip). Throttled so a rapid
+    # re-query loop does not fork a subprocess every search; --refresh forces it through,
+    # --no-refresh is the hard skip, and a stale schema always rebuilds (see should_refresh).
+    if not args.no_refresh and should_refresh(Path(args.db), args.refresh):
         idx = Path(__file__).resolve().parent / "recall-index"
         try:
-            subprocess.run([sys.executable, str(idx), "--quiet", "--db", args.db],
-                           capture_output=True, timeout=120)
+            r = subprocess.run([sys.executable, str(idx), "--quiet", "--db", args.db],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                # Do not fail silently: a failed rebuild (e.g. unwritable db) would otherwise
+                # leave a required schema migration undone and quietly serve stale results.
+                tail = (r.stderr or "").strip().splitlines()[-1:] or [""]
+                sys.stderr.write(
+                    f"warning: auto-refresh failed (rc={r.returncode}: {tail[0]}); "
+                    f"index may be stale\n")
         except Exception as e:
             sys.stderr.write(f"warning: auto-refresh skipped ({e}); index may be stale\n")
 
@@ -298,30 +536,53 @@ def main() -> int:
     path_to_note = {candidates[i]["path"]: candidates[i] for i in candidates}
     id_set = set(candidates.keys())
 
+    # per-file accumulators: line numbers to display, a genuine relevance count, and which
+    # lines came from the exact lane (so those sort ahead of loose fts-only lines per file).
+    file_lines = {}            # path -> set of line numbers to surface
+    match_count = {}           # path -> rg occurrence count (0 for fts-only files)
+    rg_line_set = {}           # path -> set of line numbers the exact lane matched
+
     # ---- lane A: ripgrep exact ----
     rg_hits = ripgrep_lane(query_str, cand_paths)
-    # keep only hits inside the candidate set (rg was already scoped to cand_paths)
-    rg_hits = [(p, ln) for (p, ln) in rg_hits if p in path_to_note]
-    # deterministic order for RRF rank assignment
-    rg_hits_sorted = sorted(
-        set(rg_hits), key=lambda pl: (path_to_note[pl[0]]["slug"], pl[0], pl[1])
+    # keep only hits inside the candidate set (rg was already scoped to cand_paths); dedupe
+    # (path,line) so a line counts once, but sum submatches for a genuine occurrence count.
+    seen_rg = {}               # (path, line) -> nsub
+    for (p, ln, nsub) in rg_hits:
+        if p in path_to_note:
+            seen_rg[(p, ln)] = nsub
+    for (p, ln), nsub in seen_rg.items():
+        file_lines.setdefault(p, set()).add(ln)
+        rg_line_set.setdefault(p, set()).add(ln)
+        match_count[p] = match_count.get(p, 0) + nsub
+    # rank files by (match_count desc, slug, path): match count is a real, deterministic
+    # relevance signal and gives a well-defined order in the rg-only degradation path.
+    rg_files = sorted(
+        match_count.keys(),
+        key=lambda p: (-match_count[p], path_to_note[p]["slug"], p),
     )
-    rg_rank = [(p, ln) for (p, ln) in rg_hits_sorted]
 
     # ---- lane B: FTS BM25 ----
-    fts_rank = []
+    fts_files = []
     dropped_short = []
     if not args.exact and fts_available:
         match_str, dropped_short = build_fts_match(tokens, tokenizer)
-        fts_file_ids = fts_lane(conn, match_str, id_set)
-        for nid in fts_file_ids:
-            note = candidates[nid]
-            for ln in fts_lines_for_file(note["path"], tokens):
-                fts_rank.append((note["path"], ln))
+        # fts_lane already returns one rowid per file ordered by bm25 asc -- use directly,
+        # no line explosion (that was the old consecutive-rank fusion bias).
+        for nid in fts_lane(conn, match_str, id_set):
+            path = candidates[nid]["path"]
+            fts_files.append(path)
+            lns = fts_lines_for_file(path, tokens)
+            if not lns:
+                # FTS matched the title/path but the (empty/all-blank) body has no line to
+                # surface. Register a file-level sentinel (line 0) so the hit is not silently
+                # dropped -- print_hit renders it as a header-only match.
+                file_lines.setdefault(path, set()).add(0)
+            for ln in lns:
+                file_lines.setdefault(path, set()).add(ln)
 
     conn.close()
 
-    if not rg_rank and not fts_rank:
+    if not file_lines:
         note = ""
         if dropped_short:
             note = f" (tokens {dropped_short} too short for the trigram index; " \
@@ -329,33 +590,46 @@ def main() -> int:
         print(f"no matches for: {query_str}{note}")
         return 0
 
-    # ---- fuse ----
-    fused = rrf_fuse([rg_rank, fts_rank])
-    # deterministic sort: fused score desc, then slug, path, line
-    ordered = sorted(
-        fused.items(),
-        key=lambda kv: (-kv[1], path_to_note[kv[0][0]]["slug"], kv[0][0], kv[0][1]),
-    )
-    ordered = ordered[: args.limit]
+    # ---- fuse (file granularity, weighted RRF) ----
+    if args.rg_weight is not None:
+        w_rg = args.rg_weight
+    else:
+        w_rg = 2.0 if looks_literal(query_str) else 1.0
+    w_fts = args.fts_weight if args.fts_weight is not None else 1.0
+    fused = rrf_fuse_files(rg_files, fts_files, w_rg, w_fts)
+
+    # Expand fused files back to (path, line) for display. Global emission order:
+    # file score desc, tie-break (match_count desc, slug, path), then WITHIN a file the exact
+    # lane's own lines first (so a real rg hit is never hidden behind loose fts-only substring
+    # lines when --limit truncates), then line asc -- a single total, deterministic key.
+    # --limit still counts total lines shown (unchanged semantics).
+    entries = [(p, ln) for p in file_lines for ln in file_lines[p]]
+    entries.sort(key=lambda pl: (
+        -fused[pl[0]], -match_count.get(pl[0], 0),
+        path_to_note[pl[0]]["slug"], pl[0],
+        0 if pl[1] in rg_line_set.get(pl[0], ()) else 1, pl[1],
+    ))
+    total_hits = len(entries)
+    ordered = entries[: args.limit]
 
     # ---- print ----
     lanes = []
-    if rg_rank:
+    if rg_files:
         lanes.append("exact")
-    if fts_rank:
+    if fts_files:
         lanes.append(f"fts:{tokenizer}")
     scope = f" | project~{args.project}" if args.project else ""
-    print(f"# recall: {query_str}   ({len(ordered)} shown / {len(fused)} hits | "
+    print(f"# recall: {query_str}   ({len(ordered)} shown / {total_hits} hits | "
           f"lanes: {', '.join(lanes) if lanes else 'none'}{scope})")
     if dropped_short:
         print(f"# note: short tokens {dropped_short} skipped in FTS (trigram needs >=3 chars)")
     print()
 
     per_project = {}
-    for (path, line_no), _score in ordered:
+    for (path, line_no) in ordered:
         note = path_to_note[path]
         per_project[note["slug"]] = per_project.get(note["slug"], 0) + 1
-        print_hit(note, line_no, max(0, args.context))
+        print_hit(note, line_no, max(0, args.context), breadcrumb=not args.no_breadcrumb)
 
     summary = ", ".join(f"{k}:{v}" for k, v in sorted(per_project.items()))
     print(f"# by project: {summary}")

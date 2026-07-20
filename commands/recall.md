@@ -6,7 +6,7 @@ allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/recall:*)
 
 # /recall
 
-Searches every `~/.claude/projects/*/memory/**/*.md` note across ALL projects and returns the EXACT matching lines (never paraphrased), tagged by project for provenance. Runs a local ripgrep-exact lane plus an FTS5 BM25 lane, fused best-first. The index auto-refreshes before each search. Local only, no network.
+Searches every `~/.claude/projects/*/memory/**/*.md` note across ALL projects and returns the EXACT matching lines (never paraphrased), tagged by project for provenance. Runs a local ripgrep-exact lane plus a weighted FTS5 BM25 lane (title/path boosted), fused best-first, each hit tagged with its enclosing markdown-heading breadcrumb. The index auto-refreshes (throttled) before each search. Local only, no network.
 
 ## Results
 

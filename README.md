@@ -10,9 +10,10 @@ No cloud. No daemon. No embeddings service. Just `ripgrep` + SQLite FTS5 over th
 $ recall heap grooming
 # recall: heap grooming   (3 shown / 20 hits | lanes: exact, fts:trigram)
 
-[proj-a]  ~/.claude/projects/-Users-you-work-proj-a/memory/nginx_notes.md:13
+[proj-a]  ~/.claude/projects/-Users-you-work-proj-a/memory/nginx_notes.md:42
     — Pool overflow grooming notes
-  >    13│ groom the pool by interleaving 2KB allocs before the overflow write…
+    ┄ # Exploitation > ## Heap layout
+  >    42│ groom the pool by interleaving 2KB allocs before the overflow write…
 
 # by project: proj-a:3
 ```
@@ -23,16 +24,18 @@ $ recall heap grooming
 - **Verbatim.** Matched lines are read live from disk and printed exactly — critical when your notes hold precise tokens (IDs, offsets, commit SHAs, version boundaries) that a summarize-then-embed system would paraphrase.
 - **Local & private.** Nothing leaves your machine. No network calls anywhere. The only thing written is a local SQLite index; your notes are read-only.
 - **Deterministic.** Same corpus + same query → identical, ranked output.
-- **Zero-maintenance.** The index auto-refreshes (incrementally) on every search — add notes any day, they're found automatically.
+- **Zero-maintenance.** The index auto-refreshes (incrementally, and throttled so rapid re-queries don't re-fork) on every search — add notes any day, they're found automatically.
 
 ## How it works
 
-Two search lanes, fused with [Reciprocal Rank Fusion](https://en.wikipedia.org/wiki/Learning_to_rank):
+Two search lanes, fused with [Reciprocal Rank Fusion](https://en.wikipedia.org/wiki/Learning_to_rank) at **file granularity** (so one strong note never crowds the results by occupying several consecutive ranks):
 
 1. **`ripgrep` exact** — fixed-string, smart-case scan for precise literals (`CVE-2024-1234`, `0xdeadbeef`, `1.2.3`, `foo->bar`, `path/to/file.c:1337`).
-2. **SQLite FTS5 (trigram) BM25** — ranked lexical/fuzzy matching for concept queries.
+2. **SQLite FTS5 (trigram) BM25** — ranked lexical/fuzzy matching for concept queries, over a **multi-column index** that weights a note's **title 4×** and its **path 1.5×** above body text, so a match in a note's name or heading ranks higher.
 
-Results are deduped by file+line, ranked best-first, and printed as `[project] path:line` + the note title + the verbatim source line(s). A `# by project:` footer shows provenance.
+When a query *looks like a literal* (a CVE id, IP, hex, version, or real path), the exact lane is automatically weighted **2×** so the precise hit wins; ordinary prose queries keep the lanes balanced.
+
+Results are ranked best-first and printed as `[project] path:line` + the note title + the verbatim source line(s). Each hit also shows its **enclosing markdown-heading breadcrumb** (`┄ ## Section > ### Subsection`) — fence-aware, so a `#` inside a code block never misleads — so you can tell where a deep hit lives at a glance. A `# by project:` footer shows provenance.
 
 ## Requirements
 
@@ -69,14 +72,20 @@ This copies the scripts to `~/.claude/recall/`, registers the `/recall` command,
 **CLI:**
 ```sh
 recall <query>                     # search everything (auto-refreshes first)
-recall CVE-2024-1234               # exact token
+recall CVE-2024-1234               # exact token (literal → exact lane weighted 2×)
 recall heap grooming               # fuzzy concept
 recall RESTORE --project redis     # scope to one project (slug substring)
 recall sdsfree --exact             # ripgrep-only, literal
 recall <query> --no-refresh        # skip the auto-reindex for a faster read
+recall <query> --refresh           # force a reindex even inside the throttle window
+recall <query> --no-breadcrumb     # omit the ┄ heading breadcrumb (byte-stable output)
+recall <query> --rg-weight 3       # override lane weights (also --fts-weight)
 recall-index                       # (rarely needed) manual full/incremental index
 recall-index --rebuild             # force a full rebuild
 ```
+
+> **Upgrading from 1.0?** The index schema changed (multi-column, weighted FTS). Your first
+> search after updating rebuilds it automatically — no action needed.
 
 *(After `./install.sh`, the scripts live at `~/.claude/recall/recall` — add that dir to your `PATH`, or call them by full path.)*
 
