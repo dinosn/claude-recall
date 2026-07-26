@@ -525,6 +525,24 @@ def main() -> int:
     tokenizer = get_meta(conn, "tokenizer", "none")
     fts_available = get_meta(conn, "fts_available", "0") == "1" and tokenizer != "none"
 
+    # SAY SO WHEN THE FTS LANE IS NOT ACTUALLY THERE. `fts_available` is a meta flag, not
+    # a fact about the table, so a half-built index reports the lane as present and
+    # returns nothing from it -- results silently narrow to the exact lane while the
+    # header claims both. That is worse than an error: the output looks authoritative.
+    if fts_available:
+        try:
+            n_fts = conn.execute("SELECT count(*) FROM notes_fts").fetchone()[0]
+            n_notes = conn.execute("SELECT count(*) FROM notes").fetchone()[0]
+            if n_fts < n_notes:
+                sys.stderr.write(
+                    f"warning: FTS index is incomplete ({n_fts}/{n_notes} rows) -- results "
+                    f"are EXACT-LANE ONLY and may be missing matches. A rebuild is probably "
+                    f"in progress; re-run when it finishes.\n")
+                fts_available = False
+        except sqlite3.Error as e:
+            sys.stderr.write(f"warning: FTS lane unusable ({e}); exact lane only\n")
+            fts_available = False
+
     candidates = load_candidates(conn, args.project)
     if not candidates:
         scope = f" for --project '{args.project}'" if args.project else ""

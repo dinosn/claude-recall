@@ -222,8 +222,20 @@ def main() -> int:
         print(f"error: cannot create index dir {db_path.parent}: {e}", file=sys.stderr)
         return 2
 
-    conn = sqlite3.connect(str(db_path))
+    # isolation_level=None puts US in charge of transactions. Python's sqlite3 opens an
+    # implicit transaction before DML but NOT before DDL, so with the default setting the
+    # `DROP TABLE notes_fts` / `CREATE VIRTUAL TABLE` below commit immediately while the
+    # backfill that repopulates them stays uncommitted until the end of the run. For that
+    # whole window every concurrent reader sees an EMPTY notes_fts -- and `recall` reports
+    # `fts_available` from a meta key rather than from the row count, so it silently
+    # degrades to the exact lane while its header still advertises `fts:trigram`.
+    # Symptom: the same query returns 4 hits during a rebuild and 125 after it.
+    # SQLite DDL *is* transactional inside an explicit transaction (verified: a reader
+    # mid-rebuild sees the old table, and the swap becomes visible only at COMMIT), so
+    # one BEGIN IMMEDIATE around the whole build closes the window.
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("BEGIN IMMEDIATE")
     ensure_base_schema(conn)
 
     # --- decide tokenizer / whether FTS needs a full rebuild ------------------
@@ -341,7 +353,7 @@ def main() -> int:
     set_meta(conn, "tokenizer", tokenizer if tokenizer else "none")
     set_meta(conn, "fts_available", "1" if fts_available else "0")
     set_meta(conn, "built_at", str(int(time.time())))
-    conn.commit()
+    conn.execute("COMMIT")
     conn.execute("PRAGMA optimize")
     conn.close()
 
