@@ -605,7 +605,18 @@ def main() -> int:
         if dropped_short:
             note = f" (tokens {dropped_short} too short for the trigram index; " \
                    f"try --exact for short literals)"
-        print(f"no matches for: {query_str}{note}")
+        # A QUOTED SENTENCE IS ONE TOKEN, AND SILENCE ABOUT THAT IS EXPENSIVE.
+        # `recall "audit the redis source for memory bugs"` looks for that exact 47-char
+        # literal; the same words unquoted find 20 hits. The zero is CORRECT -- an exact
+        # lane must not invent word-splitting, and deliberate phrase search is a feature --
+        # but bare "no matches" leaves no way to tell a real absence from a quoting
+        # mistake. Hint only on the empty result, so a phrase search that works stays
+        # silent. Semantics unchanged.
+        hint = ""
+        if len(args.query) == 1 and re.search(r"\s", args.query[0]):
+            hint = ("\n  (searched as one literal phrase — for separate terms, "
+                    "drop the quotes)")
+        print(f"no matches for: {query_str}{note}{hint}")
         return 0
 
     # ---- fuse (file granularity, weighted RRF) ----
