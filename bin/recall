@@ -18,6 +18,13 @@ presentation on top of the fused file order. Every hit shows the EXACT source li
 little context and, when available, the enclosing markdown heading breadcrumb -- nothing is
 paraphrased. Output is fully deterministic (score desc, then slug, path, line).
 
+Query semantics scale with the query. 1-3 tokens is a deliberate search and every term is
+required (AND). A sentence is not: requiring all of `prior work that was done on nginx`
+matched the one note of 49 that happened to contain every filler word. So >= SENTENCE_TOKENS
+terms are treated as prose -- the terms that cannot narrow this corpus are dropped, a single
+dominant term takes the query if one exists, and the rest are OR-ed and ranked by bm25 fused
+with idf-weighted coordination. The header names the terms actually used, always.
+
 Local only, no network. Reads the index db (read-only) and the note files themselves.
 """
 import argparse
@@ -37,6 +44,8 @@ DB_PATH = RECALL_DIR / "recall.db"
 SCHEMA_VERSION = "2"       # must match recall-index; drives the forced-refresh migration
 RRF_K = 60                 # standard RRF damping constant
 FTS_LINES_PER_FILE = 5     # cap lines surfaced per file from the FTS lane
+SENTENCE_TOKENS = 4        # >= this many tokens = prose, not a deliberate query
+DOMINANT_IDF_RATIO = 0.7   # a term this close to the rarest one is part of the query
 TITLE_MAX = 90
 # bm25 field weights for the multi-column FTS (title, path_text, content).
 BM25_WEIGHTS = (4.0, 1.5, 1.0)
@@ -288,7 +297,70 @@ def selective_tokens(conn, tokens, tokenizer, keep=6, max_frac=0.34):
             continue
         scored.append((df, t))
     scored.sort()
-    return [t for _, t in scored[:keep]]
+    if not scored:
+        return []
+    # A DOMINANT TERM IS THE QUERY. In `kafka prior work that we have done and the state
+    # of it`, `kafka` occurs in 5 notes of 261 (idf 3.97) while `done`/`prior`/`have` sit
+    # at 1.5-2.2 -- one word carries the question and the rest are grammar. Keeping them
+    # all made the group out-score the one note that is actually about Kafka. When no term
+    # dominates (`prior work that was done on nginx`: 1.70-2.21, a flat spread) the whole
+    # group is the query and all of it is kept. Ratio on idf, so it scales with the corpus.
+    idfs = {t: math.log(1.0 + total / df) for df, t in scored}
+    top = max(idfs.values())
+    kept = [t for _, t in scored if idfs[t] >= DOMINANT_IDF_RATIO * top]
+    return kept[:keep]
+
+
+def coord_rerank(conn, ids, terms, tokenizer):
+    """Re-rank an OR result by HOW MANY of the query's terms each note matches.
+
+    An OR restores coverage but loses intent. Asked `prior work that was done on nginx`
+    it put `feedback_dont_settle_least_effort.md` first: bm25 scores a note dense in
+    `done` and `prior` above one that merely mentions `nginx`, because on this corpus
+    `done` (df 32) is RARER than `nginx` (df 49). No frequency scheme can know which word
+    was the topic -- but the user typed all of them, so a note matching every term is a
+    better answer than one matching a third of them, whatever the term frequencies say.
+
+    So score each note by the terms it matches, weighted by how informative each one is
+    (idf = log(1 + N/df)), and sort by that first, bm25 order second. Counting matched
+    terms UNWEIGHTED is not enough: on the Kafka sentence it let a note matching four
+    common words outrank `reference_kafka_440_audit.md`, which matches `kafka` -- df 5 of
+    261. Weighting by idf makes one rare, meaningful term outweigh a handful of filler,
+    which is the whole point.
+
+    This is coordination level in the classic sense, and it is the piece a bare OR is
+    missing. Cheap: one FTS query per term (<= `keep`), each returning note ids only.
+    """
+    if len(terms) < 2:
+        return ids
+    total = conn.execute("SELECT count(*) FROM notes").fetchone()[0] or 1
+    score = {}
+    for t in terms:
+        if tokenizer == "trigram" and len(t) < 3:
+            continue
+        try:
+            rows = conn.execute(
+                "SELECT rowid FROM notes_fts WHERE notes_fts MATCH ?",
+                ('"' + t.replace('"', '""') + '"',)).fetchall()
+        except sqlite3.Error:
+            continue
+        if not rows:
+            continue
+        idf = math.log(1.0 + total / len(rows))
+        for (rid,) in rows:
+            score[rid] = score.get(rid, 0.0) + idf
+    # FUSE, don't override. Sorting hard by coordination throws away everything bm25
+    # knows -- term frequency and the title/path field weights -- and that signal is what
+    # identifies `reference_kafka_440_audit.md`, which carries `kafka` in its title, its
+    # path AND its body. Hard coordination ranked it below a note mentioning kafka once
+    # but matching more filler. So combine the two orderings with RRF, the same primitive
+    # the two lanes are fused with: a note needs to do well on one and not badly on the
+    # other, which is exactly the judgement neither ranking makes alone.
+    coord_order = sorted(ids, key=lambda rid: -score.get(rid, 0.0))
+    coord_rank = {rid: i for i, rid in enumerate(coord_order)}
+    bm25_rank = {rid: i for i, rid in enumerate(ids)}
+    return sorted(ids, key=lambda rid: -(1.0 / (RRF_K + bm25_rank[rid])
+                                         + 1.0 / (RRF_K + coord_rank[rid])))
 
 
 def fts_lane(conn, match_str, candidate_ids):
@@ -638,27 +710,54 @@ def main() -> int:
     relaxed_to_or = False
     relaxed_terms = []
     if not args.exact and fts_available:
-        match_str, dropped_short = build_fts_match(tokens, tokenizer)
-        fts_ids = fts_lane(conn, match_str, id_set)
+        fts_tokens = tokens
+        # A CONJUNCTION IS THE WRONG MEMBERSHIP RULE FOR A SENTENCE. Not because it finds
+        # too little -- because what it does find is an accident. Asked `prior work that
+        # was done on nginx`, AND required all six terms and returned five hits from the
+        # single note (of 49 mentioning nginx) that happened to contain every filler word.
+        # No error, no zero, so the OR rescue below never fired: a narrow answer that reads
+        # as a complete one, which is worse than the empty result this file already fixes.
+        #
+        # Document frequency cannot rescue the conjunction either. Measured on this corpus:
+        # `done` 12.3%, `nginx` 18.8%, `prior` 22.2% -- the term the user meant is neither
+        # the rarest nor separable from the filler by any threshold. So for sentence-length
+        # queries, stop gating on every term and let bm25 rank an OR over the selective
+        # ones. Notes matching all the terms still surface first; they match strictly more.
+        if len(tokens) >= SENTENCE_TOKENS:
+            picked = selective_tokens(conn, tokens, tokenizer)
+            dropped_short = [t for t in tokens
+                             if tokenizer == "trigram" and len(t) < 3]
+            terms = picked or tokens
+            match_str = build_fts_match_or(terms, tokenizer)
+            fts_ids = coord_rerank(conn, fts_lane(conn, match_str, id_set),
+                                   terms, tokenizer)
+            if fts_ids:
+                relaxed_to_or, relaxed_terms = True, picked
+                fts_tokens = terms
+        else:
+            # 1-3 tokens is a deliberate query -- every term is meant, so AND them.
+            match_str, dropped_short = build_fts_match(tokens, tokenizer)
+            fts_ids = fts_lane(conn, match_str, id_set)
         # FREE WORDING SHOULD NOT BE AN ERROR. The conjunction above is right for a
         # deliberate query and wrong for a sentence: ask it about "kafka prior work that we
         # have done and the state of it ..." and it demands every token in one note, finds
         # none, and reports "no matches" for a corpus full of Kafka work. Retry with OR and
         # let bm25 rank -- rare terms dominate, filler contributes nothing.
         # Only on a genuine zero, so no query that works today changes.
-        if not fts_ids and len(tokens) > 1:
-            # Rarest-first, so the one word that matters outranks the filler.
-            picked = selective_tokens(conn, tokens, tokenizer)
-            or_match = build_fts_match_or(picked or tokens, tokenizer)
-            if or_match:
-                relaxed_terms = picked
-                fts_ids = fts_lane(conn, or_match, id_set)
-                if fts_ids:
-                    relaxed_to_or = True
+            if not fts_ids and len(tokens) > 1:
+                # Even a short query can miss; rarest-first so the word that matters wins.
+                picked = selective_tokens(conn, tokens, tokenizer)
+                or_match = build_fts_match_or(picked or tokens, tokenizer)
+                if or_match:
+                    relaxed_terms = picked
+                    fts_ids = fts_lane(conn, or_match, id_set)
+                    if fts_ids:
+                        relaxed_to_or = True
+                        fts_tokens = picked or tokens
         for nid in fts_ids:
             path = candidates[nid]["path"]
             fts_files.append(path)
-            lns = fts_lines_for_file(path, tokens)
+            lns = fts_lines_for_file(path, fts_tokens)
             if not lns:
                 # FTS matched the title/path but the (empty/all-blank) body has no line to
                 # surface. Register a file-level sentinel (line 0) so the hit is not silently
@@ -723,6 +822,7 @@ def main() -> int:
           f"lanes: {', '.join(lanes) if lanes else 'none'}{scope})")
     if dropped_short:
         print(f"# note: short tokens {dropped_short} skipped in FTS (trigram needs >=3 chars)")
+
     print()
 
     per_project = {}

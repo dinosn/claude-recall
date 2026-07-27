@@ -23,6 +23,7 @@ $ recall heap grooming
 - **Cross-project.** Native memory is siloed per directory; this searches all of `~/.claude/projects/*/memory/`.
 - **Verbatim.** Matched lines are read live from disk and printed exactly — critical when your notes hold precise tokens (IDs, offsets, commit SHAs, version boundaries) that a summarize-then-embed system would paraphrase.
 - **Local & private.** Nothing leaves your machine. No network calls anywhere. The only thing written is a local SQLite index; your notes are read-only.
+- **Ask it in words.** A 1–3 word query is taken literally — every term is required. Ask a full question (`prior work that was done on nginx`) and it stops demanding every word, keeps the ones that actually narrow your corpus, and ranks by how informative each match is. The header always prints which terms it used, so a broadened search never looks like a precise one.
 - **Deterministic.** Same corpus + same query → identical, ranked output.
 - **Zero-maintenance.** The index auto-refreshes (incrementally, and throttled so rapid re-queries don't re-fork) on every search — add notes any day, they're found automatically.
 
