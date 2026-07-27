@@ -238,6 +238,59 @@ def build_fts_match(tokens, tokenizer):
     return " AND ".join(q(t) for t in usable), dropped
 
 
+def build_fts_match_or(tokens, tokenizer):
+    """The same tokens, OR-joined -- the fallback when AND matched nothing.
+
+    A conjunction is right for a deliberate query ("PFMERGE sparse encoding" should mean
+    both words) and wrong for a sentence. Asked `recall kafka prior work that we have done
+    and the state of it ...`, AND requires all twenty-odd tokens in one note, matches
+    nothing, and the tool answers "no matches" for a corpus that plainly contains Kafka
+    work. Retrying with OR ranks by bm25 instead, so notes matching the rare, meaningful
+    terms ("kafka") float above ones matching only the filler.
+
+    Applied ONLY when the conjunction returned zero, so every query that works today is
+    untouched -- precision is preserved where it was doing work, and free wording stops
+    being an error.
+    """
+    def q(tok):
+        return '"' + tok.replace('"', '""') + '"'
+
+    usable = [t for t in tokens if not (tokenizer == "trigram" and len(t) < 3)]
+    return " OR ".join(q(t) for t in usable) if usable else None
+
+
+def selective_tokens(conn, tokens, tokenizer, keep=6, max_frac=0.34):
+    """Keep only the terms that actually narrow the corpus.
+
+    A plain OR over a whole sentence is worse than useless: twenty tokens of filler
+    ("that", "have", "done", "state", "there") each match hundreds of notes, and bm25
+    over their sum ranks a note matching ten common words above the one note matching
+    the single word that mattered. Measured: OR-ing the user's Kafka sentence buried
+    `reference_kafka_440_audit.md` below rank 30, while `recall kafka` finds it at once.
+
+    So score each token by document frequency and keep the rarest few -- classic IDF
+    selection, computed against this corpus rather than a stopword list, so it adapts to
+    whatever the notes are about. A term appearing in more than a third of notes carries
+    no signal here and is dropped.
+    """
+    total = conn.execute("SELECT count(*) FROM notes").fetchone()[0] or 1
+    scored = []
+    for t in tokens:
+        if tokenizer == "trigram" and len(t) < 3:
+            continue
+        try:
+            df = conn.execute(
+                "SELECT count(*) FROM notes_fts WHERE notes_fts MATCH ?",
+                ('"' + t.replace('"', '""') + '"',)).fetchone()[0]
+        except sqlite3.Error:
+            continue
+        if df == 0 or df > total * max_frac:
+            continue
+        scored.append((df, t))
+    scored.sort()
+    return [t for _, t in scored[:keep]]
+
+
 def fts_lane(conn, match_str, candidate_ids):
     """Run BM25 FTS. Returns list of note-ids ordered best-first (lower bm25 = better)."""
     if match_str is None:
@@ -582,11 +635,27 @@ def main() -> int:
     # ---- lane B: FTS BM25 ----
     fts_files = []
     dropped_short = []
+    relaxed_to_or = False
+    relaxed_terms = []
     if not args.exact and fts_available:
         match_str, dropped_short = build_fts_match(tokens, tokenizer)
-        # fts_lane already returns one rowid per file ordered by bm25 asc -- use directly,
-        # no line explosion (that was the old consecutive-rank fusion bias).
-        for nid in fts_lane(conn, match_str, id_set):
+        fts_ids = fts_lane(conn, match_str, id_set)
+        # FREE WORDING SHOULD NOT BE AN ERROR. The conjunction above is right for a
+        # deliberate query and wrong for a sentence: ask it about "kafka prior work that we
+        # have done and the state of it ..." and it demands every token in one note, finds
+        # none, and reports "no matches" for a corpus full of Kafka work. Retry with OR and
+        # let bm25 rank -- rare terms dominate, filler contributes nothing.
+        # Only on a genuine zero, so no query that works today changes.
+        if not fts_ids and len(tokens) > 1:
+            # Rarest-first, so the one word that matters outranks the filler.
+            picked = selective_tokens(conn, tokens, tokenizer)
+            or_match = build_fts_match_or(picked or tokens, tokenizer)
+            if or_match:
+                relaxed_terms = picked
+                fts_ids = fts_lane(conn, or_match, id_set)
+                if fts_ids:
+                    relaxed_to_or = True
+        for nid in fts_ids:
             path = candidates[nid]["path"]
             fts_files.append(path)
             lns = fts_lines_for_file(path, tokens)
@@ -646,7 +715,9 @@ def main() -> int:
     if rg_files:
         lanes.append("exact")
     if fts_files:
-        lanes.append(f"fts:{tokenizer}")
+        lanes.append(f"fts:{tokenizer}" + (
+            f" (any-term: {' '.join(relaxed_terms)})" if relaxed_to_or and relaxed_terms
+            else " (any-term)" if relaxed_to_or else ""))
     scope = f" | project~{args.project}" if args.project else ""
     print(f"# recall: {query_str}   ({len(ordered)} shown / {total_hits} hits | "
           f"lanes: {', '.join(lanes) if lanes else 'none'}{scope})")
